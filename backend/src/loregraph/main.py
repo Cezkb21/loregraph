@@ -1,0 +1,440 @@
+import asyncio
+import logging
+from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
+from pathlib import Path
+
+from fastapi import Depends, FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from loregraph.api.go_auth_proxy import router as go_auth_proxy_router
+from loregraph.api.rate_limit import RateLimiter
+from loregraph.api.routers import (
+    agent,
+    attachments,
+    connections,
+    edges,
+    entities,
+    entity_templates,
+    files,
+    graph,
+    import_jobs,
+    knowledge,
+    play,
+    players,
+    projects,
+    realtime,
+    sheet_presets,
+    updates,
+    usage,
+)
+
+from loregraph.api.routers import (
+    network as network_router,
+)
+from loregraph.api.routers import (
+    settings as settings_router,
+)
+from loregraph.api.security import require_master
+from loregraph.api.go_auth import go_master_authenticator
+from loregraph.api.spa import mount_frontend
+from loregraph.composition import AppComposition
+from loregraph.config import Settings
+from loregraph.connectors.runtime import ConnectorRuntime
+from loregraph.connectors.setup import build_default_registry
+from loregraph.exceptions import (
+    AgentSessionNotFoundError,
+    AttachmentNotFoundError,
+    BuiltinPresetReadOnlyError,
+    BuiltinTemplateReadOnlyError,
+    CampaignError,
+    ChatAttachmentLimitExceededError,
+    ConfigurationError,
+    ConnectionNotFoundError,
+    ConnectorConfigInvalidError,
+    ConnectorUnavailableError,
+    CrossProjectEdgeError,
+    EdgeNotFoundError,
+    EntityNotFoundError,
+    EntityTemplateNotFoundError,
+    ExportConflictError,
+    ExternalDataParseError,
+    GenerationError,
+    ImportJobNotFoundError,
+    ImportJobNotIdleError,
+    InvalidEdgeReferenceError,
+    InvalidIconReferenceError,
+    InvalidPlayerTokenError,
+    KnowledgeSourceNotFoundError,
+    KnowledgeSourceNotReadyError,
+    PlayerNoteNotFoundError,
+    PlayerNotFoundError,
+    ProjectNotFoundError,
+    ReindexInProgressError,
+    SettingsFieldInvalidError,
+    SettingsFieldUnknownError,
+    SheetPresetNotFoundError,
+    SkillInputInvalidError,
+    UnknownConnectorTypeError,
+    UnknownSkillError,
+    UnsupportedAttachmentTypeError,
+    UnsupportedConnectorCapabilityError,
+    UnsupportedExportFormatError,
+    error_code,
+)
+from loregraph.observability import create_tracing
+from loregraph.schemas.project_transfer import ProjectExport
+from loregraph.services.embedding_stack import EmbeddingStack
+from loregraph.services.event_bus import EventBus
+from loregraph.services.network import NetworkService
+from loregraph.services.project_transfer import import_project
+from loregraph.services.reindex_job import ReindexService
+from loregraph.services.settings_service import SettingsProvider, sanitize_stored
+from loregraph.services.update_status import app_version
+from loregraph.storage.composition import StoreFactories
+from loregraph.storage.sqlite.db import init_db, make_session_factory
+
+SEED_DEMO_PROJECT_PATH = Path(__file__).parent / "seed" / "demo_project.json"
+
+logger = logging.getLogger(__name__)
+
+
+async def _load_settings_overrides(
+    session_factory: async_sessionmaker[AsyncSession],
+    store_factories: StoreFactories,
+) -> dict[str, object]:
+    """UI-set settings from the database, sanitized against the whitelist.
+
+    A stored value that is no longer valid (a removed field, a hand-edited
+    row) is dropped with a warning rather than taken as fatal: a bad row must
+    not be able to stop the app from starting at all."""
+    async with session_factory() as session:
+        stored = await store_factories.app_settings(session).load()
+    return sanitize_stored(stored)
+
+
+async def _seed_demo_project_if_empty(
+    session_factory: async_sessionmaker[AsyncSession],
+    store_factories: StoreFactories,
+    attachments_dir: Path,
+) -> None:
+    async with session_factory() as session:
+        project_store = store_factories.project(session)
+        if await project_store.list_projects():
+            return
+        data = ProjectExport.model_validate_json(
+            SEED_DEMO_PROJECT_PATH.read_text(encoding="utf-8")
+        )
+        await import_project(
+            project_store,
+            store_factories.entity(session),
+            store_factories.edge(session),
+            store_factories.attachment(session),
+            store_factories.entity_template(session),
+            store_factories.sheet_preset(session),
+            attachments_dir,
+            data,
+        )
+
+
+def create_app(
+    settings: Settings | None = None, composition: AppComposition | None = None
+) -> FastAPI:
+    settings = settings or Settings()
+    composition = composition or AppComposition()
+    settings.attachments_dir.mkdir(parents=True, exist_ok=True)
+    settings.knowledge_dir.mkdir(parents=True, exist_ok=True)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        engine = composition.build_engine(settings)
+        await init_db(engine)
+        app.state.engine = engine
+        app.state.session_factory = make_session_factory(engine)
+        # Realtime pub/sub for the whole app lifetime — in-process, one
+        # channel per project, created lazily (see services/event_bus.py).
+        app.state.event_bus = EventBus()
+        # Shared across requests: the limiter's job is remembering recent
+        # attempts (see api/rate_limit.py).
+        app.state.session_rate_limiter = RateLimiter()
+        # Composition root: the only place that maps storage Protocols to
+        # concrete classes. api/deps.py depends only on this bundle and on
+        # the Protocol types, never on a concrete store implementation. The
+        # public default is sqlite (see loregraph.composition); a deployment
+        # that needs a different backend passes its own AppComposition here
+        # instead of forking this function.
+        app.state.store_factories = composition.build_store_factories(settings)
+        # Settings the user changed in the UI take precedence over .env, which
+        # stays the bootstrap path (launcher wizard, Docker). Everything from
+        # here on must read `settings_provider.current` rather than the
+        # startup `settings` object, or a UI change would apply to some parts
+        # of the app and not others.
+        settings_provider = SettingsProvider(
+            settings,
+            await _load_settings_overrides(
+                app.state.session_factory, app.state.store_factories
+            ),
+        )
+        app.state.settings_provider = settings_provider
+        effective = settings_provider.current
+        # Access layer: who counts as the DM. The public default trusts
+        # loopback (see api/security.py); a private build swaps in real auth
+        # through this same seam, exactly like the storage/vector ones above.
+        app.state.master_authenticator = composition.build_master_authenticator(
+            settings
+        )
+        # External-tool connectors: the registry maps connector types to
+        # implementations; the runtime hosts long-lived clients (Foundry MCP
+        # sessions) for the app's lifetime and is closed with the lifespan.
+        app.state.connector_registry = build_default_registry()
+        app.state.connector_runtime = ConnectorRuntime()
+        # Reachability: in internet mode this asks the router to forward the
+        # port and remembers why it couldn't, so invite links and the
+        # explanation the DM sees always come from the same place.
+        network = NetworkService(settings)
+        app.state.network = network
+        await network.start()
+        # Vector layer is optional derived data: None when embeddings are
+        # disabled, and the manual editor must keep working either way.
+        # knowledge_index reuses the SAME vector store instance as
+        # vector_index (different collection namespace, see
+        # services/knowledge_index.py) — not a second client.
+        embedding_stack = EmbeddingStack(
+            effective,
+            composition.build_vector_store,
+            composition.build_embedding_provider,
+        )
+        app.state.embedding_stack = embedding_stack
+        # Changing the embedding model invalidates every stored vector, so the
+        # rebuild is a first-class background job with progress the settings
+        # page can watch — not something the user is expected to remember.
+        reindex_service = ReindexService(
+            app.state.session_factory, app.state.store_factories, embedding_stack
+        )
+        app.state.reindex_service = reindex_service
+        # Cheap metadata read, once: tells the settings page that stored
+        # vectors predate the current configuration, instead of letting the
+        # user discover it as "the assistant suddenly can't find anything".
+        async with app.state.session_factory() as session:
+            projects = await app.state.store_factories.project(session).list_projects()
+        await embedding_stack.detect_stale_index(project.id for project in projects)
+        # Off the critical path: startup stays instant, but by the time the
+        # user first hits "Generate lore" the model is (usually) loaded.
+        warmup_task = asyncio.create_task(embedding_stack.warmup())
+        # LangGraph checkpointer: interrupted agent runs must survive process
+        # restarts, so the saver lives on disk for the app's whole lifetime.
+        async with AsyncExitStack() as stack:
+            app.state.agent_checkpointer = await stack.enter_async_context(
+                AsyncSqliteSaver.from_conn_string(
+                    str(settings.agent_checkpoint_db_path)
+                )
+            )
+            # Bulk-import jobs (agent/import_graph.py) are a different graph
+            # (ImportState, not AgentState) with the same durability need —
+            # an interrupted job must survive a process restart — kept in
+            # its own file (see Settings.import_checkpoint_db_path).
+            app.state.import_checkpointer = await stack.enter_async_context(
+                AsyncSqliteSaver.from_conn_string(
+                    str(settings.import_checkpoint_db_path)
+                )
+            )
+            await _seed_demo_project_if_empty(
+                app.state.session_factory,
+                app.state.store_factories,
+                settings.attachments_dir,
+            )
+            # From the effective settings, so a tracing provider configured in
+            # the UI is picked up here — that is exactly why those fields are
+            # reported as "applies after restart" rather than applied live.
+            tracing = create_tracing(effective)
+            if tracing is not None:
+                config, lifecycle = tracing
+                lifecycle.start()
+                app.state.tracing_config = config
+                app.state.tracing_lifecycle = lifecycle
+            yield
+            # Before anything else on the way out: an app that is gone must not
+            # leave the router forwarding a port to this machine.
+            await network.stop()
+            await app.state.connector_runtime.aclose()
+            # A reindex holds sessions on the engine we are about to dispose,
+            # so it is stopped before, not after.
+            await reindex_service.stop()
+            if hasattr(app.state, "tracing_lifecycle"):
+                app.state.tracing_lifecycle.stop()
+            if not warmup_task.done():
+                warmup_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await warmup_task
+        await engine.dispose()
+
+    # In LAN play mode the interactive docs are turned off so the API surface
+    # isn't handed to everyone on the network. On loopback-only they stay on.
+    _docs_disabled = settings.play_mode_enabled
+    app = FastAPI(
+        title="Loregraph",
+        lifespan=lifespan,
+        docs_url=None if _docs_disabled else "/docs",
+        redoc_url=None if _docs_disabled else "/redoc",
+        openapi_url=None if _docs_disabled else "/openapi.json",
+    )
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        # Players authenticate with a session cookie, so cross-origin requests
+        # must be allowed to carry it. Valid because allow_origins is an
+        # explicit list, not a wildcard (the two are mutually exclusive).
+        allow_credentials=True,
+    )
+
+    _register_exception_handlers(app)
+    _API_PREFIX = "/api"
+    # Every DM router is gated on master identity in one place, so a new route
+    # can't accidentally ship unguarded. The public default trusts loopback;
+    # the realtime websocket guards itself (an HTTP dependency can't close a
+    # socket cleanly), and the player-facing routers carry their own guard.
+    _master = [Depends(require_master)]
+    app.include_router(projects.router, prefix=_API_PREFIX, dependencies=_master)
+    app.include_router(entities.router, prefix=_API_PREFIX, dependencies=_master)
+    app.include_router(
+        entity_templates.router, prefix=_API_PREFIX, dependencies=_master
+    )
+    app.include_router(sheet_presets.router, prefix=_API_PREFIX, dependencies=_master)
+    app.include_router(edges.router, prefix=_API_PREFIX, dependencies=_master)
+    app.include_router(graph.router, prefix=_API_PREFIX, dependencies=_master)
+    app.include_router(attachments.router, prefix=_API_PREFIX, dependencies=_master)
+    app.include_router(agent.router, prefix=_API_PREFIX, dependencies=_master)
+    app.include_router(import_jobs.router, prefix=_API_PREFIX, dependencies=_master)
+    app.include_router(knowledge.router, prefix=_API_PREFIX, dependencies=_master)
+    app.include_router(usage.router, prefix=_API_PREFIX, dependencies=_master)
+    app.include_router(settings_router.router, prefix=_API_PREFIX, dependencies=_master)
+    app.include_router(
+        connections.types_router, prefix=_API_PREFIX, dependencies=_master
+    )
+    app.include_router(connections.router, prefix=_API_PREFIX, dependencies=_master)
+    app.include_router(updates.router, prefix=_API_PREFIX, dependencies=_master)
+    app.include_router(players.router, prefix=_API_PREFIX, dependencies=_master)
+    app.include_router(network_router.router, prefix=_API_PREFIX, dependencies=_master)
+    # No master dependency: the websocket authenticates itself per-route.
+    app.include_router(realtime.router, prefix=_API_PREFIX)
+    # Player-facing API: its own player-token guard, never the master one, and
+    # it takes the project from the token, not the URL.
+    app.include_router(play.router, prefix=_API_PREFIX)
+    # Attachments: an access-checked route, not a bare StaticFiles mount (which
+    # would bypass every guard and hand any file to anyone on the network).
+    # Its own route resolves either identity, so no blanket master dependency.
+    app.include_router(files.router)
+    # Server-side proxy to the Go auth service, for packaged installs where
+    # only the backend faces the network (see api/go_auth_proxy.py).
+    app.include_router(go_auth_proxy_router)
+
+    @app.get("/api/health")
+    def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    # Separate from /api/updates on purpose: the version is always knowable
+    # and free, while the update status depends on files the launcher writes.
+    @app.get("/api/version")
+    def app_version_endpoint() -> dict[str, str]:
+        return {"version": app_version()}
+
+    # Last: the SPA fallback claims every remaining path, so it must be
+    # registered after every API route or it would swallow them.
+    mount_frontend(app, settings.frontend_dist)
+
+    return app
+
+
+def _error_response(status_code: int, exc: Exception) -> JSONResponse:
+    # `code` is the single machine-readable field the frontend's i18n catalog
+    # keys off; `detail` is an English diagnostic string, never translated
+    # Deriving `code` from the exception class name (error_code) means
+    # a new CampaignError subclass gets a working code with zero boilerplate
+    # here — only status codes that aren't the 400 default need a handler.
+    return JSONResponse(
+        status_code=status_code, content={"code": error_code(exc), "detail": str(exc)}
+    )
+
+
+def _register_exception_handlers(app: FastAPI) -> None:
+    _not_found = (
+        ProjectNotFoundError,
+        EntityNotFoundError,
+        EdgeNotFoundError,
+        AttachmentNotFoundError,
+        AgentSessionNotFoundError,
+        KnowledgeSourceNotFoundError,
+        ConnectionNotFoundError,
+        UnknownSkillError,
+        ImportJobNotFoundError,
+        EntityTemplateNotFoundError,
+        SheetPresetNotFoundError,
+        PlayerNotFoundError,
+        PlayerNoteNotFoundError,
+    )
+    for exc_type in _not_found:
+        app.add_exception_handler(exc_type, lambda _r, e: _error_response(404, e))
+
+    # An unknown or revoked play token is an auth failure, not a 400.
+    app.add_exception_handler(
+        InvalidPlayerTokenError, lambda _r, e: _error_response(401, e)
+    )
+
+    _unprocessable = (
+        InvalidEdgeReferenceError,
+        CrossProjectEdgeError,
+        UnsupportedExportFormatError,
+        InvalidIconReferenceError,
+        UnsupportedAttachmentTypeError,
+        ChatAttachmentLimitExceededError,
+        UnknownConnectorTypeError,
+        ConnectorConfigInvalidError,
+        UnsupportedConnectorCapabilityError,
+        ExternalDataParseError,
+        SkillInputInvalidError,
+        SettingsFieldUnknownError,
+        SettingsFieldInvalidError,
+    )
+    for unprocessable_type in _unprocessable:
+        app.add_exception_handler(
+            unprocessable_type, lambda _r, e: _error_response(422, e)
+        )
+
+    app.add_exception_handler(ConfigurationError, lambda _r, e: _error_response(409, e))
+    app.add_exception_handler(GenerationError, lambda _r, e: _error_response(502, e))
+    app.add_exception_handler(
+        ConnectorUnavailableError, lambda _r, e: _error_response(502, e)
+    )
+    app.add_exception_handler(
+        ExportConflictError, lambda _r, e: _error_response(409, e)
+    )
+    app.add_exception_handler(
+        ImportJobNotIdleError, lambda _r, e: _error_response(409, e)
+    )
+    app.add_exception_handler(
+        ReindexInProgressError, lambda _r, e: _error_response(409, e)
+    )
+    app.add_exception_handler(
+        KnowledgeSourceNotReadyError, lambda _r, e: _error_response(409, e)
+    )
+    app.add_exception_handler(
+        BuiltinTemplateReadOnlyError, lambda _r, e: _error_response(409, e)
+    )
+    app.add_exception_handler(
+        BuiltinPresetReadOnlyError, lambda _r, e: _error_response(409, e)
+    )
+    # Fallback for every other CampaignError subclass (including the
+    # HITL/session-state guards in api/routers/agent.py) — 400, code still
+    # derived automatically from the concrete class.
+    app.add_exception_handler(CampaignError, lambda _r, e: _error_response(400, e))
+
+
+app = create_app(
+    composition=AppComposition(build_master_authenticator=go_master_authenticator)
+)

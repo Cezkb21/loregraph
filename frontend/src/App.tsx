@@ -1,0 +1,94 @@
+import {
+  Outlet,
+  RouterProvider,
+  createBrowserRouter,
+  createHashRouter,
+} from "react-router-dom";
+
+import { privateRoutes } from "@loregraph/private-ui";
+import "./App.css";
+import { DemoBanner } from "./components/DemoBanner";
+import { Layout } from "./components/layout/Layout";
+import { AppSettingsPage } from "./pages/AppSettingsPage";
+import { AssistantPage } from "./pages/AssistantPage";
+import { EntityEditPage } from "./pages/EntityEditPage";
+import { EntityListPage } from "./pages/EntityListPage";
+import { GraphViewPage } from "./pages/GraphViewPage";
+import { HelpPage } from "./pages/HelpPage";
+import { IntegrationsPage } from "./pages/IntegrationsPage";
+import { LoginPage } from "./pages/LoginPage";
+import { ProjectListPage } from "./pages/ProjectListPage";
+import { ProjectSettingsPage } from "./pages/ProjectSettingsPage";
+import { PlayBoardPage } from "./play/PlayBoardPage";
+import { PlayEntityListPage } from "./play/PlayEntityListPage";
+import { PlayEntityPage } from "./play/PlayEntityPage";
+import { PlayLayout } from "./play/PlayLayout";
+import { RegisterPage } from "./pages/RegisterPage";
+import { RequireMaster } from "./components/RequireMaster";
+
+// Data router (not <BrowserRouter>) — pages with unsaved edits use
+// useBlocker to intercept in-app navigation, which plain routers don't
+// support. The GitHub Pages demo build uses a hash router so deep links work
+// without server-side SPA rewrites; createHashRouter keeps the same data
+// router APIs (useBlocker included).
+const createRouter = import.meta.env.VITE_DEMO
+  ? createHashRouter
+  : createBrowserRouter;
+
+const router = createRouter([
+    {
+    path: "/login",
+    element: <LoginPage />,
+    },
+    {
+      path: "/register",
+      element: <RegisterPage />,
+    },
+    {
+    // Player view: sibling to the DM Layout, not a child — no DM sidebar or
+    // tools. The token in the path is exchanged for a session cookie in
+    // PlayLayout.
+    path: "/play/:token",
+    element: <PlayLayout />,
+    children: [
+      { index: true, element: <PlayEntityListPage /> },
+      { path: "board", element: <PlayBoardPage /> },
+      { path: "entity/:id", element: <PlayEntityPage /> },
+    ],
+  },
+  {
+    element: (
+    <RequireMaster>
+      <Layout>
+        <Outlet />
+      </Layout>
+    </RequireMaster>
+    ),
+    children: [
+      { path: "/", element: <ProjectListPage /> },
+      // App-level, not project-level: which model answers and which embedder
+      // indexes are properties of the installation (see AppSettingsPage).
+      { path: "/settings", element: <AppSettingsPage /> },
+      { path: "/projects/:projectId/entities", element: <EntityListPage /> },
+      { path: "/projects/:projectId/entities/new", element: <EntityEditPage /> },
+      { path: "/projects/:projectId/entities/:id", element: <EntityEditPage /> },
+      { path: "/projects/:projectId/graph", element: <GraphViewPage /> },
+      { path: "/projects/:projectId/assistant", element: <AssistantPage /> },
+      { path: "/projects/:projectId/integrations", element: <IntegrationsPage /> },
+      { path: "/projects/:projectId/settings", element: <ProjectSettingsPage /> },
+      { path: "/projects/:projectId/help", element: <HelpPage /> },
+      ...privateRoutes,
+    ],
+  },
+]);
+
+function App() {
+  return (
+    <>
+      <RouterProvider router={router} />
+      {import.meta.env.VITE_DEMO && <DemoBanner />}
+    </>
+  );
+}
+
+export default App;

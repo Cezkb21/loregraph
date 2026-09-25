@@ -1,0 +1,52 @@
+import { useState } from "react";
+import { useTranslation } from "react-i18next";
+
+import { useConnections, useConnectorTypes } from "../../hooks/useConnections";
+import { ConnectionCard } from "./ConnectionCard";
+import { ConnectionFormDialog } from "./ConnectionFormDialog";
+import { Icon } from "../ui/Icon";
+
+export function IntegrationsPanel({ projectId }: { projectId: string }) {
+  const { t } = useTranslation();
+  const { data: types } = useConnectorTypes();
+  const { data: connections, isLoading } = useConnections(projectId);
+  const [formOpen, setFormOpen] = useState(false);
+
+  return (
+    <section className="settings-card integrations-panel">
+      {/* The page above owns the title — the panel is the list itself. */}
+      <p className="field-hint">{t("integrations.hint")}</p>
+
+      {isLoading && <p className="field-hint">{t("common.loading")}</p>}
+
+      {connections && connections.length === 0 && (
+        <p className="field-hint">{t("integrations.noConnections")}</p>
+      )}
+
+      <ul className="integrations-list">
+        {connections?.map((conn) => (
+          <ConnectionCard key={conn.id} connection={conn} projectId={projectId} connectorTypes={types ?? []} />
+        ))}
+      </ul>
+
+      <div className="settings-save-row">
+        <button
+          type="button"
+          className="button-primary"
+          onClick={() => setFormOpen(true)}
+        >
+          <Icon name="plus" size={14} />
+          {t("integrations.addButton")}
+        </button>
+      </div>
+
+      {formOpen && types && (
+        <ConnectionFormDialog
+          projectId={projectId}
+          connectorTypes={types}
+          onClose={() => setFormOpen(false)}
+        />
+      )}
+    </section>
+  );
+}

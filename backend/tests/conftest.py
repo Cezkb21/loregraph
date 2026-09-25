@@ -1,0 +1,54 @@
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from loregraph.config import Settings
+from loregraph.main import create_app
+
+
+@pytest.fixture
+def settings(tmp_path: Path) -> Settings:
+    # _env_file=None: tests must not read the developer's real backend/.env
+    # (with real API keys). embedding_provider="disabled": API tests must not
+    # download embedding models; the vector layer has its own tests with a
+    # fake embedder. dict-splat because mypy doesn't see pydantic-settings'
+    # dynamic init kwargs.
+    kwargs: dict[str, Any] = {
+        "data_dir": tmp_path,
+        "embedding_provider": "disabled",
+        "anthropic_api_key": None,
+        "openai_api_key": None,
+        "llm_provider": "anthropic",
+        "_env_file": None,
+    }
+    return Settings(**kwargs)
+
+
+@pytest.fixture
+def app(settings: Settings) -> FastAPI:
+    return create_app(settings)
+
+
+@pytest.fixture
+def client(app: FastAPI) -> Iterator[TestClient]:
+    # client=("127.0.0.1", ...): the master guard trusts loopback, and
+    # Starlette's default test client host is "testclient" (not an IP), which
+    # would be rejected as a non-loopback caller. Pinning it to a loopback
+    # address makes the whole existing suite the DM, exactly as before the
+    # guard existed. Player tests override the identity per-request instead.
+    with TestClient(app, client=("127.0.0.1", 50000)) as test_client:
+        yield test_client
+
+
+@pytest.fixture
+def project_id(client: TestClient) -> str:
+    # Every test gets its own fresh project — isolated from the demo project
+    # that main.py auto-seeds on first startup (see _seed_demo_project_if_empty).
+    resp = client.post("/api/projects", json={"name": "Test Project"})
+    created_id = resp.json()["id"]
+    assert isinstance(created_id, str)
+    return created_id

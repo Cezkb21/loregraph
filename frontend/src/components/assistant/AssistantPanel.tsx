@@ -1,0 +1,1271 @@
+import { useQuery } from "@tanstack/react-query";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { Link } from "react-router-dom";
+
+import type { AgentReviewPayload, AgentSession, DraftEntity, LoreDraft } from "../../api/agent";
+import { ApiError, apiClient } from "../../api/client";
+import type { Edge, Entity } from "../../api/types";
+import {
+  type AgentChat,
+  useAgentChat,
+  useAgentConfig,
+  useAgentSessions,
+} from "../../hooks/useAgent";
+import { useAutoGrowTextarea } from "../../hooks/useAutoGrowTextarea";
+import { useDismiss } from "../../hooks/useDismiss";
+import { useEntities } from "../../hooks/useEntities";
+import { useFileDrop } from "../../hooks/useFileDrop";
+import { useFilePaste } from "../../hooks/useFilePaste";
+import { eventTone, translateEvent, translateWarning } from "../../i18n/eventText";
+import { typeColor, typeSoftBackground } from "../../lib/typeColor";
+import { Icon } from "../ui/Icon";
+import { Markdown } from "../ui/Markdown";
+import { composerAvailability, isSubmitKeypress } from "./composerState";
+import { DraftPreviewDrawer } from "./DraftPreviewDrawer";
+import { moveMenuIndex, sessionStatusTone } from "./sessionMenu";
+
+interface AssistantPanelProps {
+  projectId: string;
+  /** Called with created entity ids after an approved commit — the graph
+   * page uses it to focus the freshly generated web. */
+  onCommitted?: (entityIds: string[]) => void;
+  /** Page-level callers pass their own title so it renders in the same row
+   * as the history picker instead of a separate heading block above it; the
+   * graph drawer omits it and keeps its own header (with a close button). */
+  heading?: string;
+}
+
+/** Conversational co-author: chat about the world (grounded answers), get
+ * clarifying questions back, and review whole lore batches inline — with
+ * per-stage progress and token streaming. */
+export function AssistantPanel({ projectId, onCommitted, heading }: AssistantPanelProps) {
+  const { t } = useTranslation();
+  const { data: config, error: configError } = useAgentConfig();
+  const { data: entities } = useEntities(projectId);
+  const chat = useAgentChat(projectId, onCommitted);
+  // Owned here (not inside ChatInput) so the idle state's example prompts —
+  // rendered in the transcript, a sibling — can seed the composer too.
+  const [composerText, setComposerText] = useState("");
+  const [composerAnchorId, setComposerAnchorId] = useState("");
+
+  if (configError instanceof ApiError && configError.status === 404) {
+    return (
+      <div className="assistant-onboarding">
+        <h2>{t("assistant.onboarding.restartHeading")}</h2>
+        <p>{t("assistant.onboarding.restartBody")}</p>
+        <pre>{`cd backend
+uv sync
+uv run uvicorn loregraph.main:app --reload`}</pre>
+      </div>
+    );
+  }
+  if (config && !config.llm_configured) {
+    return <OnboardingCard provider={config.llm_provider} />;
+  }
+
+  return (
+    <div className="assistant-panel">
+      <SessionPicker projectId={projectId} chat={chat} heading={heading} />
+      <Transcript
+        chat={chat}
+        entities={entities ?? []}
+        projectId={projectId}
+        onExamplePick={(instruction) => setComposerText(instruction)}
+      />
+      <ChatInput
+        chat={chat}
+        entities={entities ?? []}
+        projectId={projectId}
+        text={composerText}
+        setText={setComposerText}
+        anchorId={composerAnchorId}
+        setAnchorId={setComposerAnchorId}
+      />
+    </div>
+  );
+}
+
+/** Themed replacement for a native <select> (its light, browser-chrome
+ * popup didn't follow the app's dark theme). Menu semantics rather than
+ * listbox: each entry is its own focusable button, matching KebabMenu
+ * elsewhere in this file's neighborhood — Arrow/Home/End roving is added on
+ * top since this one specifically replaces a control that had it natively. */
+function SessionPicker({
+  projectId,
+  chat,
+  heading,
+}: {
+  projectId: string;
+  chat: AgentChat;
+  heading?: string;
+}) {
+  const { t } = useTranslation();
+  const { data: sessions } = useAgentSessions(projectId);
+  const recent = (sessions ?? []).filter((s) => s.title).slice(0, 8);
+  const hasHistory = recent.length > 0 || chat.threadId !== null;
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  useDismiss(open, rootRef, () => setOpen(false));
+
+  useEffect(() => {
+    if (open) menuRef.current?.querySelector<HTMLButtonElement>("[role='menuitem']")?.focus();
+  }, [open]);
+
+  if (!heading && !hasHistory) return null;
+
+  const current = recent.find((session) => session.thread_id === chat.threadId);
+
+  function focusMenuItem(key: "ArrowDown" | "ArrowUp" | "Home" | "End") {
+    const items = menuRef.current?.querySelectorAll<HTMLButtonElement>("[role='menuitem']");
+    if (!items || items.length === 0) return;
+    const from = Array.from(items).indexOf(document.activeElement as HTMLButtonElement);
+    items[moveMenuIndex(from, key, items.length)]?.focus();
+  }
+
+  return (
+    <div className="assistant-session-picker" ref={rootRef}>
+      {heading && <h1 className="assistant-session-heading">{heading}</h1>}
+      {hasHistory && (
+        <div className="assistant-session-trigger-wrap">
+          <button
+            type="button"
+            className="assistant-session-trigger"
+            aria-haspopup="menu"
+            aria-expanded={open}
+            onClick={() => setOpen((v) => !v)}
+            onKeyDown={(e) => {
+              if (e.key === "ArrowDown" && !open) {
+                e.preventDefault();
+                setOpen(true);
+              }
+            }}
+          >
+            {current && (
+              <span className={`assistant-session-status tone-${sessionStatusTone(current.status)}`}>
+                {t(`assistant.status.${current.status}` as const)}
+              </span>
+            )}
+            <span className="assistant-session-trigger-label">
+              {current ? current.title : t("assistant.historyPlaceholder")}
+            </span>
+            <Icon name="chevron-down" size={13} />
+          </button>
+          {open && (
+            <div
+              className="assistant-session-menu"
+              role="menu"
+              aria-label={t("assistant.historyPlaceholder")}
+              ref={menuRef}
+              onKeyDown={(e) => {
+                if (e.key !== "ArrowDown" && e.key !== "ArrowUp" && e.key !== "Home" && e.key !== "End")
+                  return;
+                e.preventDefault();
+                focusMenuItem(e.key);
+              }}
+            >
+              {recent.map((session: AgentSession) => (
+                <button
+                  key={session.thread_id}
+                  type="button"
+                  role="menuitem"
+                  aria-current={session.thread_id === chat.threadId || undefined}
+                  className="assistant-session-option"
+                  onClick={() => {
+                    setOpen(false);
+                    if (session.thread_id !== chat.threadId) void chat.openSession(session.thread_id);
+                  }}
+                >
+                  <span className={`assistant-session-status tone-${sessionStatusTone(session.status)}`}>
+                    {t(`assistant.status.${session.status}` as const)}
+                  </span>
+                  <span className="assistant-session-option-title" title={session.title}>
+                    {session.title}
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+      {chat.threadId && (
+        <button
+          type="button"
+          className="icon-button icon-button-accent"
+          onClick={chat.reset}
+          title={t("assistant.newConversation")}
+          aria-label={t("assistant.newConversation")}
+        >
+          <Icon name="plus" size={15} />
+        </button>
+      )}
+    </div>
+  );
+}
+
+// Static conversation starters for the idle state — unlike SuggestionHints
+// (graph-hole-driven, only appears when applicable), these are always
+// available so a first-time chat never opens on a blank page.
+const EXAMPLE_PROMPT_KEYS = [
+  "addLore",
+  "weaveCharacter",
+  "checkConsistency",
+  "suggestLinks",
+] as const;
+
+function Transcript({
+  chat,
+  entities,
+  projectId,
+  onExamplePick,
+}: {
+  chat: AgentChat;
+  entities: Entity[];
+  projectId: string;
+  onExamplePick: (instruction: string) => void;
+}) {
+  const { t } = useTranslation();
+  const bottomRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [chat.messages, chat.statusNode, chat.pendingReview]);
+
+  const isEmpty =
+    chat.messages.length === 0 && !chat.pendingReview && !chat.busy;
+
+  return (
+    <div className="assistant-transcript">
+      {isEmpty && (
+        <div className="assistant-idle-state">
+          <p className="assistant-empty-invite">
+            <Icon name="sparkles" size={14} />
+            {entities.length === 0
+              ? t("assistant.emptyInviteEmptyWorld")
+              : t("assistant.emptyInviteHasWorld")}
+          </p>
+          <div className="assistant-hints">
+            {EXAMPLE_PROMPT_KEYS.map((key) => (
+              <button
+                key={key}
+                type="button"
+                className="assistant-hint-chip"
+                onClick={() => onExamplePick(t(`assistant.examplePrompts.${key}.instruction`))}
+              >
+                {t(`assistant.examplePrompts.${key}.label`)}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+      {chat.messages.map((message, index) => {
+        if (message.event_code) {
+          // Deterministic backend events are one translated sentence, not
+          // authored prose — a compact system notice, not a speech bubble.
+          return (
+            <div
+              key={`${index}-event`}
+              className={`assistant-event-notice tone-${eventTone(message.event_code)}`}
+            >
+              {translateEvent(message.event_code, message.event_params ?? {}, message.text, t)}
+            </div>
+          );
+        }
+        return (
+          <div
+            key={`${index}-${message.role}`}
+            className={`assistant-bubble assistant-bubble-${message.role}`}
+          >
+            {message.attachments.length > 0 && (
+              <div className="assistant-attachment-chips">
+                {message.attachments.map((filename) => (
+                  <span key={filename} className="assistant-attachment-chip">
+                    <Icon name="paperclip" size={12} /> {filename}
+                  </span>
+                ))}
+              </div>
+            )}
+            {message.role === "assistant" ? (
+              <Markdown className="markdown-view assistant-markdown">
+                {message.text}
+              </Markdown>
+            ) : (
+              // The DM's own text stays verbatim: what they typed is what they
+              // meant, asterisks and all.
+              message.text
+            )}
+          </div>
+        );
+      })}
+      {chat.statusNode && (
+        <div className="assistant-status-line">
+          {t([`assistant.stage.${chat.statusNode}`, "assistant.stage.fallback"], {
+            node: chat.statusNode,
+          })}
+        </div>
+      )}
+      {chat.pendingReview?.draft && !chat.pendingReview?.entity_edit_draft && (
+        <ReviewCard
+          review={chat.pendingReview}
+          entities={entities}
+          projectId={projectId}
+          busy={chat.busy}
+          onDecision={(action, draft, feedback) =>
+            void chat.review({ action, draft, feedback })
+          }
+        />
+      )}
+      {chat.pendingReview?.entity_edit_draft && (
+        <EditReviewCard
+          review={chat.pendingReview}
+          entities={entities}
+          busy={chat.busy}
+          onDecision={(action, draft, feedback) =>
+            void chat.review({ action, draft, feedback })
+          }
+        />
+      )}
+      {chat.error && <p className="assistant-error">{chat.error}</p>}
+      <div ref={bottomRef} />
+    </div>
+  );
+}
+
+// Auto-grow bounds for the composer textarea: starts at ~2 lines (matching
+// the old fixed rows={2}) and grows to ~7 before scrolling internally, so a
+// long paste never pushes Send off the bottom of the panel.
+const COMPOSER_MIN_HEIGHT = 52;
+const COMPOSER_MAX_HEIGHT = 200;
+
+function ChatInput({
+  chat,
+  entities,
+  projectId,
+  text,
+  setText,
+  anchorId,
+  setAnchorId,
+}: {
+  chat: AgentChat;
+  entities: Entity[];
+  projectId: string;
+  text: string;
+  setText: (text: string) => void;
+  anchorId: string;
+  setAnchorId: (anchorId: string) => void;
+}) {
+  const { t } = useTranslation();
+  const [files, setFiles] = useState<File[]>([]);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // While a draft awaits review, new messages are rejected by the backend —
+  // block them in the UI too, with an explanation.
+  const reviewPending = chat.pendingReview !== null;
+  const { blocked, canSend } = composerAvailability({ text, busy: chat.busy, reviewPending });
+  useAutoGrowTextarea(textareaRef, text, COMPOSER_MIN_HEIGHT, COMPOSER_MAX_HEIGHT);
+
+  function submit() {
+    if (!canSend) return;
+    const trimmed = text.trim();
+    setText("");
+    setFiles([]);
+    void chat.send(trimmed, anchorId || null, files);
+  }
+
+  function handleFilesPicked(e: React.ChangeEvent<HTMLInputElement>) {
+    const picked = Array.from(e.target.files ?? []);
+    e.target.value = "";
+    if (picked.length > 0) setFiles((prev) => [...prev, ...picked]);
+  }
+
+  function removeFile(index: number) {
+    setFiles((prev) => prev.filter((_, i) => i !== index));
+  }
+
+  const addFiles = useCallback((added: File[]) => {
+    setFiles((prev) => [...prev, ...added]);
+  }, []);
+
+  const { isDragging, dropHandlers } = useFileDrop((dropped) => {
+    if (blocked) return;
+    addFiles(dropped);
+  });
+  const { pasteHandlers } = useFilePaste(addFiles, !blocked);
+
+  return (
+    <div
+      className={`assistant-chat-input${isDragging ? " assistant-chat-input-dragging" : ""}`}
+      {...dropHandlers}
+      {...pasteHandlers}
+    >
+      {isDragging && (
+        <div className="assistant-drop-overlay" aria-hidden="true">
+          {t("assistant.dropHint")}
+        </div>
+      )}
+      <SuggestionHints
+        projectId={projectId}
+        entities={entities}
+        onPick={(hint) => {
+          setText(hint.instruction);
+          setAnchorId(hint.anchorId ?? "");
+        }}
+      />
+      {files.length > 0 && (
+        <div className="assistant-attachment-chips">
+          {files.map((file, index) => (
+            <span key={`${file.name}-${index}`} className="assistant-attachment-chip">
+              <Icon name="paperclip" size={12} /> {file.name}
+              <button
+                type="button"
+                className="assistant-attachment-remove"
+                onClick={() => removeFile(index)}
+                title={t("assistant.removeFileTitle")}
+                aria-label={t("assistant.removeFileTitle")}
+              >
+                <Icon name="x" size={12} />
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
+      <div className="assistant-composer-surface">
+        <textarea
+          ref={textareaRef}
+          className="assistant-composer-input"
+          rows={2}
+          placeholder={
+            reviewPending
+              ? t("assistant.inputPlaceholderBlocked")
+              : t("assistant.inputPlaceholderDefault")
+          }
+          value={text}
+          disabled={blocked}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => {
+            if (isSubmitKeypress(e.key, e.shiftKey)) {
+              e.preventDefault();
+              submit();
+            }
+          }}
+        />
+        <div className="assistant-input-row">
+          {entities.length > 0 && (
+            <label className="assistant-context-label" title={t("assistant.anchorTitle")}>
+              {t("assistant.contextLabel")}:
+              <select value={anchorId} onChange={(e) => setAnchorId(e.target.value)}>
+                <option value="">{t("assistant.anchorWholeWorld")}</option>
+                {entities.map((entity) => (
+                  <option key={entity.id} value={entity.id}>
+                    {entity.title}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          <button
+            type="button"
+            className="icon-button"
+            disabled={blocked}
+            title={t("assistant.attachTitle")}
+            aria-label={t("assistant.attachTitle")}
+            onClick={() => fileInputRef.current?.click()}
+          >
+            <Icon name="paperclip" />
+          </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            accept="image/jpeg,image/png,image/gif,image/webp,.pdf,.txt,.md,.markdown,.json,.csv,.tsv,.yaml,.yml,.log"
+            onChange={handleFilesPicked}
+            style={{ display: "none" }}
+          />
+          <button
+            type="button"
+            className="assistant-send-button"
+            disabled={!canSend}
+            onClick={submit}
+          >
+            {chat.busy && <span className="spinner" aria-hidden="true" />}
+            {chat.busy ? t("assistant.sending") : t("assistant.sendButton")}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function OnboardingCard({ provider }: { provider: string }) {
+  const { t } = useTranslation();
+  return (
+    <div className="assistant-onboarding">
+      <h2>{t("assistant.onboarding.setupHeading")}</h2>
+      <p>
+        {t("assistant.onboarding.setupBody1", { provider })} <code>{provider}</code>
+      </p>
+      {/* The settings page is the path now: a key typed there applies
+          immediately, while .env only takes effect on the next start. */}
+      <p>{t("assistant.onboarding.setupUi")}</p>
+      <Link className="button-primary" to="/settings">
+        {t("assistant.onboarding.setupCta")}
+      </Link>
+      <p className="field-hint">{t("assistant.onboarding.setupEnvNote")}</p>
+    </div>
+  );
+}
+
+interface Hint {
+  text: string;
+  instruction: string;
+  anchorId?: string;
+}
+
+/** Deterministic, zero-LLM-cost suggestions computed from graph holes. */
+function SuggestionHints({
+  projectId,
+  entities,
+  onPick,
+}: {
+  projectId: string;
+  entities: Entity[];
+  onPick: (hint: Hint) => void;
+}) {
+  const { t } = useTranslation();
+  const { data: edges } = useQuery({
+    queryKey: ["edges", projectId],
+    queryFn: () => apiClient.get<Edge[]>(`/api/projects/${projectId}/edges`),
+  });
+
+  const hints = useMemo<Hint[]>(() => {
+    if (!edges || entities.length === 0) return [];
+    const connected = new Set<string>();
+    for (const edge of edges) {
+      connected.add(edge.source_entity_id);
+      connected.add(edge.target_entity_id);
+    }
+    return entities
+      .filter((entity) => !connected.has(entity.id))
+      .slice(0, 2)
+      .map((entity) => ({
+        text: t("assistant.hintIsolatedText", { title: entity.title }),
+        instruction: t("assistant.hintIsolatedInstruction", { title: entity.title }),
+        anchorId: entity.id,
+      }));
+  }, [edges, entities, t]);
+
+  if (hints.length === 0) return null;
+  return (
+    <div className="assistant-hints">
+      {hints.map((hint) => (
+        <button
+          key={hint.anchorId ?? hint.text}
+          type="button"
+          className="assistant-hint-chip"
+          onClick={() => onPick(hint)}
+        >
+          {hint.text}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function ReviewCard({
+  review,
+  entities,
+  projectId,
+  busy,
+  onDecision,
+}: {
+  review: AgentReviewPayload;
+  entities: Entity[];
+  projectId: string;
+  busy: boolean;
+  onDecision: (
+    action: "approve" | "reject" | "revise",
+    draft: LoreDraft,
+    feedback?: string,
+  ) => void;
+}) {
+  const { t } = useTranslation();
+  const [draft, setDraft] = useState<LoreDraft>(review.draft!);
+  const [removedRefs, setRemovedRefs] = useState<Set<string>>(new Set());
+  const [removedPatches, setRemovedPatches] = useState<Set<number>>(new Set());
+  const [removedRelationships, setRemovedRelationships] = useState<Set<number>>(
+    new Set(),
+  );
+  const [feedback, setFeedback] = useState("");
+  const [showFeedback, setShowFeedback] = useState(false);
+  const [previewRef, setPreviewRef] = useState<string | null>(null);
+
+  // A revise replaces the payload — resync local editing state. Guarded
+  // internally (not via an early return above the hooks) so every hook in
+  // this component runs on every render regardless of review.draft — an
+  // early return before useEffect/useMemo would violate the Rules of Hooks
+  // the moment this card's mount condition ever stops matching its own
+  // `review.draft` check 1:1.
+  useEffect(() => {
+    if (!review.draft) return;
+    setDraft(review.draft);
+    setRemovedRefs(new Set());
+    setRemovedPatches(new Set());
+    setRemovedRelationships(new Set());
+    setFeedback("");
+    setShowFeedback(false);
+    setPreviewRef(null);
+  }, [review]);
+
+  const existingTitleById = useMemo(
+    () => new Map(entities.map((entity) => [entity.id, entity.title])),
+    [entities],
+  );
+  const draftTitleByRef = useMemo(
+    () => new Map(draft.entities.map((entity) => [entity.ref, entity.title])),
+    [draft.entities],
+  );
+  // Update/delete ops name an existing relationship by id; showing what that
+  // relationship currently says is the whole point of reviewing a change to
+  // it. Fetched live rather than snapshotted into the review payload, which
+  // would be stale by the time a session is reopened. Same query key as
+  // SuggestionHints, so this shares its cache instead of refetching.
+  const { data: existingEdges } = useQuery({
+    queryKey: ["edges", projectId],
+    queryFn: () => apiClient.get<Edge[]>(`/projects/${projectId}/edges`),
+  });
+  const edgeById = useMemo(
+    () => new Map((existingEdges ?? []).map((edge) => [edge.id, edge])),
+    [existingEdges],
+  );
+
+  // Edit-only reviews are handled by EditReviewCard — this component only
+  // renders when review.draft is present. Placed after every hook call.
+  if (!review.draft) return null;
+
+  const targetName = (ref: string) =>
+    draftTitleByRef.get(ref) ?? existingTitleById.get(ref) ?? ref;
+
+  /** An endpoint survives review if it is an entity being created that the DM
+   * kept, or an entity that already exists. Applied to both sides — a
+   * relationship between two existing entities has no draft entity behind it
+   * at all and must not be dropped for lacking one. */
+  function endpointSurvives(ref: string, keptRefs: Set<string>): boolean {
+    return keptRefs.has(ref) || existingTitleById.has(ref);
+  }
+
+  function keptDraft(): LoreDraft {
+    const keptEntities = draft.entities.filter((e) => !removedRefs.has(e.ref));
+    const keptRefs = new Set(keptEntities.map((e) => e.ref));
+    return {
+      entities: keptEntities,
+      patches: draft.patches.filter((_, index) => !removedPatches.has(index)),
+      relationships: draft.relationships.filter((relationship, index) => {
+        if (removedRelationships.has(index)) return false;
+        if ((relationship.op ?? "create") !== "create") return true;
+        return (
+          endpointSurvives(relationship.source_ref, keptRefs) &&
+          endpointSurvives(relationship.target_ref, keptRefs)
+        );
+      }),
+    };
+  }
+
+  function updateEntity(ref: string, patch: Partial<DraftEntity>) {
+    setDraft((prev) => ({
+      ...prev,
+      entities: prev.entities.map((entity) =>
+        entity.ref === ref ? { ...entity, ...patch } : entity,
+      ),
+    }));
+  }
+
+  const keptRefs = new Set(
+    draft.entities.filter((e) => !removedRefs.has(e.ref)).map((e) => e.ref),
+  );
+  const keptEntityCount = draft.entities.length - removedRefs.size;
+  const keptPatchCount = draft.patches.length - removedPatches.size;
+  // Patches and relationship ops count toward what "approve" applies: a
+  // proposal that only edits an entity or rewires the graph creates no
+  // entity, and counting entities alone would leave its approve button
+  // permanently disabled.
+  const keptOpCount = keptDraft().relationships.length;
+  const keptCount = keptEntityCount + keptPatchCount + keptOpCount;
+
+  return (
+    <div className="assistant-review">
+      {review.warnings.length > 0 && (
+        <ul className="assistant-warnings">
+          {review.warnings.map((warning, index) => (
+            <li key={`${warning.code}-${index}`}>
+              <Icon name="alert" size={13} /> {translateWarning(warning, t)}
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <div className="assistant-draft-entities">
+        {draft.entities.map((entity) => {
+          const removed = removedRefs.has(entity.ref);
+          return (
+            <div
+              key={entity.ref}
+              className={
+                removed ? "assistant-draft-entity removed" : "assistant-draft-entity"
+              }
+            >
+              <div className="assistant-draft-entity-head">
+                <label
+                  className="assistant-draft-keep"
+                  title={t("assistant.review.includeInCommitTitle")}
+                >
+                  <input
+                    type="checkbox"
+                    checked={!removed}
+                    onChange={() =>
+                      setRemovedRefs((prev) => {
+                        const next = new Set(prev);
+                        if (next.has(entity.ref)) next.delete(entity.ref);
+                        else next.add(entity.ref);
+                        return next;
+                      })
+                    }
+                  />
+                </label>
+                <input
+                  className="assistant-draft-title"
+                  value={entity.title}
+                  disabled={removed}
+                  onChange={(e) => updateEntity(entity.ref, { title: e.target.value })}
+                />
+                <span className="assistant-draft-type">{entity.type}</span>
+                {entity.grounded_in.length === 0 && (
+                  <span
+                    className="assistant-draft-new"
+                    title={t("assistant.review.newBadgeTitle")}
+                  >
+                    <Icon name="sparkles" size={14} />
+                  </span>
+                )}
+                <button
+                  type="button"
+                  className="icon-button icon-button-accent"
+                  title={t("assistant.review.detailsTitle")}
+                  aria-label={t("assistant.review.detailsTitle")}
+                  onClick={() => setPreviewRef(entity.ref)}
+                >
+                  <Icon name="expand" size={14} />
+                </button>
+              </div>
+              {!removed && (
+                <textarea
+                  rows={2}
+                  value={entity.summary}
+                  onChange={(e) =>
+                    updateEntity(entity.ref, { summary: e.target.value })
+                  }
+                />
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {draft.patches.length > 0 && (
+        <div className="assistant-draft-patches">
+          {draft.patches.map((patch, index) => {
+            const removed = removedPatches.has(index);
+            const existing = entities.find((e) => e.id === patch.entity_id);
+            const currentByKey = new Map(
+              (existing?.fields ?? []).map((f) => [f.key, String(f.value)]),
+            );
+            return (
+              <div
+                key={`${patch.entity_id}-${index}`}
+                className={
+                  removed
+                    ? "assistant-draft-patch removed"
+                    : "assistant-draft-patch"
+                }
+              >
+                <div className="assistant-draft-entity-head">
+                  <label
+                    className="assistant-draft-keep"
+                    title={t("assistant.review.includeInCommitTitle")}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={!removed}
+                      onChange={() =>
+                        setRemovedPatches((prev) => {
+                          const next = new Set(prev);
+                          if (next.has(index)) next.delete(index);
+                          else next.add(index);
+                          return next;
+                        })
+                      }
+                    />
+                    <span className="assistant-edit-badge">
+                      {t("assistant.review.editHeading")}
+                    </span>
+                  </label>
+                  <strong className="assistant-draft-title">
+                    {patch.title ?? existing?.title ?? patch.entity_id}
+                  </strong>
+                </div>
+
+                {patch.title && existing && patch.title !== existing.title && (
+                  <div className="assistant-patch-field">
+                    <span className="assistant-patch-key">
+                      {t("assistant.review.titleLabel")}
+                    </span>
+                    <span className="assistant-patch-old">{existing.title}</span>
+                    {" → "}
+                    <span className="assistant-patch-new">{patch.title}</span>
+                  </div>
+                )}
+
+                {patch.set_fields.map((field) => {
+                  const current = currentByKey.get(field.key);
+                  const isNew = current === undefined;
+                  return (
+                    <div className="assistant-patch-field" key={field.key}>
+                      <span className="assistant-patch-key">
+                        {field.key}
+                        {isNew && (
+                          <span className="assistant-patch-tag">
+                            {" "}
+                            {t("assistant.review.newFieldTag")}
+                          </span>
+                        )}
+                      </span>
+                      {!isNew && (
+                        <>
+                          <span className="assistant-patch-old">{current}</span>
+                          {" → "}
+                        </>
+                      )}
+                      <span className="assistant-patch-new">
+                        {String(field.value)}
+                      </span>
+                    </div>
+                  );
+                })}
+
+                {patch.remove_field_keys.map((key) => (
+                  <div className="assistant-patch-field" key={`rm-${key}`}>
+                    <span className="assistant-patch-key assistant-relationship-struck">
+                      {key}
+                    </span>{" "}
+                    <span className="assistant-patch-tag">
+                      {t("assistant.review.removeFieldTag")}
+                    </span>
+                  </div>
+                ))}
+
+                {patch.edit_reason && (
+                  <p className="assistant-patch-reason">
+                    <em>{patch.edit_reason}</em>
+                  </p>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {draft.relationships.length > 0 && (
+        <div className="assistant-relationships">
+          {draft.relationships.map((relationship, index) => {
+            const op = relationship.op ?? "create";
+            // Only a create can be orphaned by unchecking an entity; an
+            // update or delete points at a relationship that already exists
+            // independently of anything in this draft.
+            const blocked =
+              op === "create" &&
+              (!endpointSurvives(relationship.source_ref, keptRefs) ||
+                !endpointSurvives(relationship.target_ref, keptRefs));
+            const removed = removedRelationships.has(index) || blocked;
+            const current = relationship.edge_id
+              ? edgeById.get(relationship.edge_id)
+              : undefined;
+            return (
+              <label
+                key={`${op}-${relationship.edge_id ?? ""}-${relationship.source_ref}-${relationship.type}-${relationship.target_ref}`}
+                className={[
+                  "assistant-relationship",
+                  `assistant-relationship-${op}`,
+                  removed ? "removed" : "",
+                ]
+                  .filter(Boolean)
+                  .join(" ")}
+              >
+                <input
+                  type="checkbox"
+                  checked={!removed}
+                  disabled={blocked}
+                  onChange={() =>
+                    setRemovedRelationships((prev) => {
+                      const next = new Set(prev);
+                      if (next.has(index)) next.delete(index);
+                      else next.add(index);
+                      return next;
+                    })
+                  }
+                />
+                <span>
+                  <span className="assistant-relationship-op">
+                    {t(`assistant.review.op.${op}` as const)}
+                  </span>{" "}
+                  {op === "create" ? (
+                    <>
+                      <strong>{targetName(relationship.source_ref)}</strong> —
+                      {relationship.type}→{" "}
+                      <strong>{targetName(relationship.target_ref)}</strong>
+                      <em> {relationship.reason}</em>
+                    </>
+                  ) : (
+                    <>
+                      <span
+                        className={
+                          op === "delete" ? "assistant-relationship-struck" : undefined
+                        }
+                      >
+                        <strong>
+                          {targetName(current?.source_entity_id ?? "")}
+                        </strong>{" "}
+                        —{current?.type ?? "?"}→{" "}
+                        <strong>
+                          {targetName(current?.target_entity_id ?? "")}
+                        </strong>
+                      </span>
+                      {op === "update" && (
+                        <>
+                          {" → "}
+                          <strong>
+                            {targetName(
+                              relationship.reverse
+                                ? (current?.target_entity_id ?? "")
+                                : (current?.source_entity_id ?? ""),
+                            )}
+                          </strong>{" "}
+                          —{relationship.type || (current?.type ?? "?")}→{" "}
+                          <strong>
+                            {targetName(
+                              relationship.reverse
+                                ? (current?.source_entity_id ?? "")
+                                : (current?.target_entity_id ?? ""),
+                            )}
+                          </strong>
+                        </>
+                      )}
+                      {relationship.reason && <em> {relationship.reason}</em>}
+                    </>
+                  )}
+                </span>
+              </label>
+            );
+          })}
+        </div>
+      )}
+
+      <p className="assistant-review-cost">
+        {t("assistant.review.tokensSuffix", {
+          count: review.input_tokens + review.output_tokens,
+        })}
+      </p>
+
+      {showFeedback && (
+        <div className="assistant-feedback">
+          <textarea
+            rows={2}
+            autoFocus
+            placeholder={t("assistant.review.feedbackPlaceholder")}
+            value={feedback}
+            onChange={(e) => setFeedback(e.target.value)}
+          />
+          <button
+            type="button"
+            className="button-primary"
+            disabled={!feedback.trim() || busy}
+            onClick={() => onDecision("revise", keptDraft(), feedback.trim())}
+          >
+            {t("assistant.review.sendRevision")}
+          </button>
+        </div>
+      )}
+
+      <div className="assistant-review-actions">
+        <button
+          type="button"
+          className="assistant-approve"
+          disabled={busy || keptCount === 0}
+          onClick={() => onDecision("approve", keptDraft())}
+        >
+          {t("assistant.review.approve", { count: keptCount })}
+        </button>
+        <button
+          type="button"
+          className="assistant-request-changes"
+          disabled={busy}
+          onClick={() => setShowFeedback((v) => !v)}
+        >
+          {t("assistant.review.requestChanges")}
+        </button>
+        <button
+          type="button"
+          className="assistant-reject"
+          disabled={busy}
+          onClick={() => onDecision("reject", draft)}
+        >
+          {t("assistant.review.reject")}
+        </button>
+      </div>
+
+      {previewRef !== null &&
+        (() => {
+          const previewEntity = draft.entities.find((e) => e.ref === previewRef);
+          if (!previewEntity) return null;
+          return (
+            <DraftPreviewDrawer
+              entity={previewEntity}
+              relationships={draft.relationships}
+              targetName={targetName}
+              onClose={() => setPreviewRef(null)}
+            />
+          );
+        })()}
+    </div>
+  );
+}
+
+function EditReviewCard({
+  review,
+  entities,
+  busy,
+  onDecision,
+}: {
+  review: AgentReviewPayload;
+  entities: Entity[];
+  busy: boolean;
+  onDecision: (
+    action: "approve" | "reject" | "revise",
+    draft: LoreDraft | null,
+    feedback?: string,
+  ) => void;
+}) {
+  const { t } = useTranslation();
+  const [feedback, setFeedback] = useState("");
+  const [showFeedback, setShowFeedback] = useState(false);
+  const [showPreview, setShowPreview] = useState(false);
+  const ed = review.entity_edit_draft!;
+  const color = typeColor(ed.type);
+
+  useEffect(() => {
+    setFeedback("");
+    setShowFeedback(false);
+  }, [review]);
+
+  const existingEntity = useMemo(
+    () => entities.find((e) => e.id === ed.entity_id),
+    [entities, ed.entity_id],
+  );
+
+  const existingFieldMap = useMemo(() => {
+    if (!existingEntity) return new Map<string, string>();
+    return new Map(
+      existingEntity.fields.map((f) => [f.key, String(f.value)]),
+    );
+  }, [existingEntity]);
+
+  const existingSummary = existingFieldMap.get("summary") ?? "";
+
+  const fieldChanges = useMemo(() => {
+    const currentKeys = new Set(existingFieldMap.keys());
+    const proposedKeys = new Set(ed.fields.map((f) => f.key));
+    const allKeys = [...currentKeys, ...proposedKeys];
+    const changes: { key: string; current: string; proposed: string; isNew: boolean; isRemoved: boolean }[] = [];
+    for (const key of allKeys) {
+      if (key === "summary") continue;
+      const current = existingFieldMap.get(key) ?? "";
+      const proposed = ed.fields.find((f) => f.key === key)?.value ?? "";
+      if (current === proposed) continue;
+      changes.push({
+        key,
+        current,
+        proposed,
+        isNew: !currentKeys.has(key),
+        isRemoved: !proposedKeys.has(key),
+      });
+    }
+    return changes;
+  }, [existingFieldMap, ed.fields]);
+
+  const summaryChanged = ed.summary !== existingSummary;
+
+  return (
+    <div className="assistant-review assistant-edit-review">
+      {review.warnings.length > 0 && (
+        <ul className="assistant-warnings">
+          {review.warnings.map((warning, index) => (
+            <li key={`${warning.code}-${index}`}>
+              <Icon name="alert" size={13} /> {translateWarning(warning, t)}
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <div className="assistant-edit-header">
+        <span className="assistant-draft-type">{ed.type}</span>
+        <span
+          className="assistant-edit-badge"
+          style={{ background: typeSoftBackground(ed.type), color, borderColor: "transparent" }}
+        >
+          {t("assistant.review.editHeading")}
+        </span>
+      </div>
+
+      <h3 className="assistant-edit-entity-title">
+        {existingEntity?.title ?? ed.entity_id}
+        <button
+          type="button"
+          className="icon-button icon-button-accent"
+          title={t("assistant.review.detailsTitle")}
+          aria-label={t("assistant.review.detailsTitle")}
+          onClick={() => setShowPreview(true)}
+        >
+          <Icon name="expand" size={14} />
+        </button>
+      </h3>
+
+      {ed.edit_reason && (
+        <p className="assistant-edit-reason">
+          <strong>{t("assistant.review.editReason")}:</strong> {ed.edit_reason}
+        </p>
+      )}
+
+      {summaryChanged && (
+        <div className="assistant-edit-diff-section">
+          <h4>Summary</h4>
+          <div className="assistant-edit-diff">
+            {existingSummary && (
+              <div className="assistant-edit-old">
+                <span className="assistant-edit-label">{t("assistant.review.editCurrentHeading")}</span>
+                {existingSummary}
+              </div>
+            )}
+            <div className="assistant-edit-new">
+              <span className="assistant-edit-label">{t("assistant.review.editProposedHeading")}</span>
+              {ed.summary}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {fieldChanges.length > 0 && (
+        <div className="assistant-edit-diff-section">
+          <h4>{t("entityDetail.fields")}</h4>
+          {fieldChanges.map((change) => (
+            <div key={change.key} className="assistant-edit-field-change">
+              <span className="assistant-edit-field-key">{change.key}</span>
+              <div className="assistant-edit-diff">
+                {change.current && (
+                  <div className="assistant-edit-old">
+                    <span className="assistant-edit-label">{t("assistant.review.editCurrentHeading")}</span>
+                    {change.current}
+                  </div>
+                )}
+                {change.isRemoved ? (
+                  <div className="assistant-edit-removed">
+                    <span className="assistant-edit-label">—</span>
+                    <em>{t("common.remove")}</em>
+                  </div>
+                ) : (
+                  <div className="assistant-edit-new">
+                    <span className="assistant-edit-label">{change.isNew ? t("assistant.review.newBadgeTitle").split("—")[0].trim() : t("assistant.review.editProposedHeading")}</span>
+                    {change.proposed}
+                  </div>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {!summaryChanged && fieldChanges.length === 0 && (
+        <p className="assistant-edit-no-changes">
+          {t("assistant.review.editHeading")} — no field changes detected.
+        </p>
+      )}
+
+      <p className="assistant-review-cost">
+        {t("assistant.review.tokensSuffix", {
+          count: review.input_tokens + review.output_tokens,
+        })}
+      </p>
+
+      {showFeedback && (
+        <div className="assistant-feedback">
+          <textarea
+            rows={2}
+            autoFocus
+            placeholder={t("assistant.review.feedbackPlaceholder")}
+            value={feedback}
+            onChange={(e) => setFeedback(e.target.value)}
+          />
+          <button
+            type="button"
+            className="button-primary"
+            disabled={!feedback.trim() || busy}
+            onClick={() => onDecision("revise", null, feedback.trim())}
+          >
+            {t("assistant.review.sendRevision")}
+          </button>
+        </div>
+      )}
+
+      <div className="assistant-review-actions">
+        <button
+          type="button"
+          className="assistant-approve"
+          disabled={busy}
+          onClick={() => onDecision("approve", null)}
+        >
+          {t("assistant.review.approve", { count: 1 })}
+        </button>
+        <button
+          type="button"
+          className="assistant-request-changes"
+          disabled={busy}
+          onClick={() => setShowFeedback((v) => !v)}
+        >
+          {t("assistant.review.requestChanges")}
+        </button>
+        <button
+          type="button"
+          className="assistant-reject"
+          disabled={busy}
+          onClick={() => onDecision("reject", null)}
+        >
+          {t("assistant.review.reject")}
+        </button>
+      </div>
+
+      {showPreview && (
+        <DraftPreviewDrawer
+          entity={{
+            ref: ed.entity_id,
+            type: ed.type,
+            title: ed.title,
+            summary: ed.summary,
+            fields: ed.fields,
+            grounded_in: [],
+          }}
+          relationships={[]}
+          targetName={(ref) => entities.find((e) => e.id === ref)?.title ?? ref}
+          onClose={() => setShowPreview(false)}
+        />
+      )}
+    </div>
+  );
+}

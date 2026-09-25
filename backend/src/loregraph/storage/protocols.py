@@ -1,0 +1,296 @@
+from collections.abc import Mapping, Sequence
+from typing import Any, Protocol, runtime_checkable
+
+from loregraph.schemas.agent import (
+    AgentReviewPayload,
+    AgentSessionOut,
+    AgentSessionStatus,
+)
+from loregraph.schemas.attachment import AttachmentOut
+from loregraph.schemas.connection import (
+    ConnectionCreate,
+    ConnectionEntityLinkOut,
+    ConnectionOut,
+    ConnectionUpdate,
+)
+from loregraph.schemas.edge import EdgeCreate, EdgeOut, EdgeUpdate
+from loregraph.schemas.entity import (
+    EntityCreate,
+    EntityOut,
+    EntityPatch,
+    EntityPlayerViewUpdate,
+    EntityPositionEntry,
+    EntityUpdate,
+)
+from loregraph.schemas.entity_template import (
+    EntityTemplateCreate,
+    EntityTemplateOut,
+    EntityTemplateUpdate,
+)
+from loregraph.schemas.import_job import (
+    ImportJobOut,
+    ImportJobStatus,
+    ImportReviewPayload,
+)
+from loregraph.schemas.knowledge import KnowledgeSourceOut
+from loregraph.schemas.player import PlayerNoteRecord, PlayerOut
+from loregraph.schemas.project import ProjectCreate, ProjectOut, ProjectUpdate
+from loregraph.schemas.sheet_preset import SheetPresetCreate, SheetPresetOut
+from loregraph.schemas.usage import UsageEvent, UsageRollupRow
+
+
+@runtime_checkable
+class ProjectStore(Protocol):
+    async def list_projects(self) -> list[ProjectOut]: ...
+    async def create(self, data: ProjectCreate) -> ProjectOut: ...
+    async def get(self, project_id: str) -> ProjectOut: ...
+    async def update(self, project_id: str, data: ProjectUpdate) -> ProjectOut: ...
+    async def delete(self, project_id: str) -> None: ...
+    async def exists(self, project_id: str) -> bool: ...
+
+
+@runtime_checkable
+class EntityStore(Protocol):
+    async def list_entities(
+        self, project_id: str, entity_type: str | None = None
+    ) -> list[EntityOut]: ...
+    async def list_entity_types(self, project_id: str) -> list[str]: ...
+    async def create(self, data: EntityCreate, project_id: str) -> EntityOut: ...
+    async def get(self, entity_id: str) -> EntityOut: ...
+    async def get_many(self, entity_ids: Sequence[str]) -> list[EntityOut]: ...
+    async def exists(self, entity_id: str) -> bool: ...
+    async def update(self, entity_id: str, data: EntityUpdate) -> EntityOut: ...
+    async def patch(self, entity_id: str, data: EntityPatch) -> EntityOut: ...
+    async def delete(self, entity_id: str) -> None: ...
+    async def set_icon(
+        self, entity_id: str, attachment_id: str | None
+    ) -> EntityOut: ...
+    async def set_player_view(
+        self, entity_id: str, data: EntityPlayerViewUpdate
+    ) -> EntityOut: ...
+    async def update_positions(
+        self, positions: Sequence[EntityPositionEntry]
+    ) -> list[EntityOut]: ...
+
+
+@runtime_checkable
+class EdgeStore(Protocol):
+    async def get(self, edge_id: str) -> EdgeOut: ...
+    async def list_for_entity(self, entity_id: str) -> list[EdgeOut]: ...
+    async def list_all(
+        self, project_id: str, edge_types: frozenset[str] | None = None
+    ) -> list[EdgeOut]: ...
+    async def create(self, data: EdgeCreate, project_id: str) -> EdgeOut: ...
+    async def update(self, edge_id: str, data: EdgeUpdate) -> EdgeOut: ...
+    async def delete(self, edge_id: str) -> None: ...
+
+
+@runtime_checkable
+class EntityTemplateStore(Protocol):
+    """User-defined templates only. Built-in templates are merged in above the
+    store, at the service layer (see services/entity_template_service.py)."""
+
+    async def list_for_project(self, project_id: str) -> list[EntityTemplateOut]: ...
+    async def get(self, template_id: str) -> EntityTemplateOut: ...
+    async def create(
+        self, project_id: str, data: EntityTemplateCreate
+    ) -> EntityTemplateOut: ...
+    async def update(
+        self, template_id: str, data: EntityTemplateUpdate
+    ) -> EntityTemplateOut: ...
+    async def delete(self, template_id: str) -> None: ...
+
+
+@runtime_checkable
+class SheetPresetStore(Protocol):
+    """User-saved presets only. Built-in presets are merged in above the
+    store, at the service layer (see services/sheet_preset_service.py)."""
+
+    async def list_for_project(self, project_id: str) -> list[SheetPresetOut]: ...
+    async def get(self, preset_id: str) -> SheetPresetOut: ...
+    async def create(
+        self, project_id: str, data: SheetPresetCreate
+    ) -> SheetPresetOut: ...
+    async def delete(self, preset_id: str) -> None: ...
+
+
+@runtime_checkable
+class AgentSessionStore(Protocol):
+    async def create(self, project_id: str, thread_id: str) -> AgentSessionOut: ...
+    async def get(self, thread_id: str) -> AgentSessionOut: ...
+    async def list_for_project(self, project_id: str) -> list[AgentSessionOut]: ...
+    async def update(
+        self,
+        thread_id: str,
+        *,
+        status: AgentSessionStatus | None = None,
+        title: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        committed_entity_ids: list[str] | None = None,
+        review: AgentReviewPayload | None = None,
+        clear_review: bool = False,
+    ) -> AgentSessionOut: ...
+
+
+@runtime_checkable
+class ImportJobStore(Protocol):
+    """Catalog of bulk-import jobs — same split as AgentSessionStore: the
+    ImportState checkpointer owns the graph state, this owns the listing/
+    progress (see storage/sqlite/models.py::ImportJobRow)."""
+
+    async def create(
+        self, project_id: str, job_id: str, source_id: str, source_filename: str
+    ) -> ImportJobOut: ...
+    async def get(self, job_id: str) -> ImportJobOut: ...
+    async def list_for_project(self, project_id: str) -> list[ImportJobOut]: ...
+    async def update(
+        self,
+        job_id: str,
+        *,
+        status: ImportJobStatus | None = None,
+        total_windows: int | None = None,
+        total_slices: int | None = None,
+        current_slice: int | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        committed_entity_ids: list[str] | None = None,
+        review: ImportReviewPayload | None = None,
+        clear_review: bool = False,
+    ) -> ImportJobOut: ...
+
+
+@runtime_checkable
+class UsageStore(Protocol):
+    """Granular per-call LLM token accounting (per node/model/session/project,
+    cache-aware). Written at each call site during a run; read as a project
+    rollup for the usage endpoint."""
+
+    async def record(self, event: UsageEvent) -> None: ...
+    async def project_rollup(self, project_id: str) -> list[UsageRollupRow]: ...
+
+
+@runtime_checkable
+class AppSettingsStore(Protocol):
+    """Overrides of `Settings` fields set from the UI, keyed by field name.
+
+    Not project-scoped: which model answers and which embedder indexes are
+    properties of the installation, not of one campaign."""
+
+    async def load(self) -> dict[str, Any]: ...
+    async def set_many(self, values: Mapping[str, Any]) -> None: ...
+    async def delete_keys(self, keys: Sequence[str]) -> None: ...
+
+
+@runtime_checkable
+class AttachmentStore(Protocol):
+    async def create(
+        self,
+        entity_id: str,
+        original_filename: str,
+        content_type: str,
+        content: bytes,
+    ) -> AttachmentOut: ...
+    async def list_for_entity(self, entity_id: str) -> list[AttachmentOut]: ...
+    async def delete(self, attachment_id: str) -> None: ...
+
+
+@runtime_checkable
+class ConnectionStore(Protocol):
+    async def list_for_project(self, project_id: str) -> list[ConnectionOut]: ...
+    async def create(
+        self, project_id: str, data: ConnectionCreate
+    ) -> ConnectionOut: ...
+    async def get(self, connection_id: str) -> ConnectionOut: ...
+    async def update(
+        self, connection_id: str, data: ConnectionUpdate
+    ) -> ConnectionOut: ...
+    async def delete(self, connection_id: str) -> None: ...
+
+
+@runtime_checkable
+class ConnectionEntityLinkStore(Protocol):
+    async def upsert(
+        self,
+        connection_id: str,
+        entity_id: str,
+        external_id: str,
+        external_kind: str,
+    ) -> ConnectionEntityLinkOut: ...
+    async def list_for_connection(
+        self, connection_id: str
+    ) -> list[ConnectionEntityLinkOut]: ...
+    async def get_by_external(
+        self, connection_id: str, external_kind: str, external_id: str
+    ) -> ConnectionEntityLinkOut | None: ...
+    async def list_for_entity(
+        self, connection_id: str, entity_id: str
+    ) -> list[ConnectionEntityLinkOut]: ...
+    async def delete_for_entity(self, connection_id: str, entity_id: str) -> None: ...
+
+
+@runtime_checkable
+class PlayerStore(Protocol):
+    """Invited players of a project. Tokens are handled as hashes only — the
+    caller generates and hashes the raw token; this store never sees it in
+    the clear (see api/routers/players.py)."""
+
+    async def list_for_project(self, project_id: str) -> list[PlayerOut]: ...
+    async def get(self, player_id: str) -> PlayerOut: ...
+    async def create(
+        self, project_id: str, name: str, token_hash: str, token_prefix: str
+    ) -> PlayerOut: ...
+    async def rename(self, player_id: str, name: str) -> PlayerOut: ...
+    async def set_token(
+        self, player_id: str, token_hash: str, token_prefix: str
+    ) -> PlayerOut: ...
+    async def set_revoked(self, player_id: str, revoked: bool) -> PlayerOut: ...
+    async def delete(self, player_id: str) -> None: ...
+    async def find_active_by_token_hash(self, token_hash: str) -> PlayerOut | None: ...
+    async def touch_last_seen(self, player_id: str) -> None: ...
+
+
+@runtime_checkable
+class PlayerNoteStore(Protocol):
+    """Per-entity player notes. Returns storage records (with the author id)
+    so the service can decide what each viewer is allowed to see — the store
+    itself does no visibility filtering."""
+
+    async def list_for_entity(self, entity_id: str) -> list[PlayerNoteRecord]: ...
+    async def get(self, note_id: str) -> PlayerNoteRecord: ...
+    async def create(
+        self,
+        project_id: str,
+        player_id: str,
+        entity_id: str,
+        body: dict[str, object],
+        is_public: bool,
+    ) -> PlayerNoteRecord: ...
+    async def update(
+        self, note_id: str, body: dict[str, object], is_public: bool
+    ) -> PlayerNoteRecord: ...
+    async def delete(self, note_id: str) -> None: ...
+    async def count_by_player(self, project_id: str) -> dict[str, int]: ...
+
+
+@runtime_checkable
+class KnowledgeSourceStore(Protocol):
+    async def create(
+        self,
+        project_id: str,
+        original_filename: str,
+        content_type: str,
+        content: bytes,
+    ) -> KnowledgeSourceOut: ...
+    async def list_for_project(self, project_id: str) -> list[KnowledgeSourceOut]: ...
+    async def get(self, source_id: str) -> KnowledgeSourceOut: ...
+    async def update_status(
+        self,
+        source_id: str,
+        *,
+        status: str,
+        error: str | None = None,
+        chunk_count: int | None = None,
+    ) -> KnowledgeSourceOut: ...
+    async def delete(self, source_id: str) -> None: ...
+    async def read_content(self, source_id: str) -> bytes: ...
