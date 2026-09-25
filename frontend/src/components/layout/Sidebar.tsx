@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { NavLink, useLocation, useMatch } from "react-router-dom";
 
+import { getAccessToken } from "../../lib/authStorage";
+import { logoutGo } from "../../lib/goAuth";
 import { privateNavItems } from "@loregraph/private-ui";
 import { useLastProject } from "../../hooks/useLastProject";
 import { useProjects } from "../../hooks/useProjects";
@@ -199,6 +201,7 @@ export function Sidebar() {
         )}
         <SidebarFeedbackButton collapsed={collapsed} />
         <ThemeToggle collapsed={collapsed} />
+        <LogoutButton collapsed={collapsed} />
       </div>
 
       <CommandPalette
@@ -229,6 +232,43 @@ function CollapseButton({
       aria-expanded={!collapsed}
     >
       <Icon name="panel-left" size={17} />
+    </button>
+  );
+}
+
+/** Logs the DM out of the Go auth service and reloads to /login.
+ *
+ * Only rendered when a token exists — on loopback there usually isn't one
+ * (the backend trusts the machine), and offering a "log out" for a session
+ * that never started is just confusing. Reload rather than React navigate:
+ * React Query's cache still holds data fetched with the old token, and
+ * rendering it after logout would show things the user no longer has the
+ * right to see. */
+function LogoutButton({ collapsed }: { collapsed: boolean }) {
+  const { t } = useTranslation();
+  if (getAccessToken() === null) return null;
+
+  async function handleLogout() {
+    await logoutGo();
+    window.location.assign("/login");
+  }
+
+  const label = t("nav.logout");
+  return (
+    <button
+      type="button"
+      className="sidebar-nav-item"
+      onClick={handleLogout}
+      title={collapsed ? label : undefined}
+      // Отступ сверху отделяет "покинуть систему" от остальных действий —
+      // визуально видно, что это другой тип действия, не «ещё одна кнопка
+      // в списке». Скругление больше остальных контролов, потому что
+      // это и есть единственная "закруглённая" кнопка в футере, так что
+      // она выделяется приятно, а не случайно.
+      style={{ marginTop: 8, borderRadius: 12 }}
+    >
+      <Icon name="logout" size={17} className="sidebar-nav-icon" />
+      {!collapsed && <span className="sidebar-nav-label">{label}</span>}
     </button>
   );
 }

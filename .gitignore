@@ -35,3 +35,11 @@ CLAUDE.md
 
 # mimo
 .mimocode/
+
+# auth
+.env
+*.pem
+*.b64
+coverage
+users.json
+refresh_tokens.json
